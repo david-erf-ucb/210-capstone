@@ -2,5 +2,9 @@
 __pycache__/
 .ipynb_checkpoints/
 data/
+test_results/
+cache/
+METRE/output/*.parquet
+METRE/output/*.csv
 *.pyc
 .DS_Store

@@ -516,7 +516,7 @@ def query_antibiotics_mimic(client, icuids_to_keep):
 
 def query_vasoactive_mimic(client, icuids_to_keep, vasoactive_drugs):
     query = """
-            select i.subject_id, i.hadm_id, v.stay_id, v.starttime, v.endtime, i.icu_intime, i.icu_outtime, 
+            select i.subject_id, i.hadm_id, v.stay_id, v.starttime, v.endtime, i.icu_intime, i.icu_outtime
             FROM physionet-data.mimiciv_3_1_derived.icustay_detail i
             INNER JOIN physionet-data.mimiciv_3_1_derived.vasoactive_agent v ON i.stay_id = v.stay_id
             where v.stay_id in ({icuids})
@@ -851,10 +851,10 @@ def get_group_id_eicu(args, client):
     elif args.patient_group == 'Shock':
         query = \
             """
-            SELECT DISTINCT pm.patientunitstayid, 
+            SELECT DISTINCT pm.patientunitstayid
             FROM physionet-data.eicu_crd_derived.pivoted_med pm
             INNER JOIN physionet-data.eicu_crd_derived.icustay_detail i ON i.patientunitstayid = pm.patientunitstayid
-            WHERE (pm.dopamine = 1 or pm.norepinephrine = 1 or pm.epinephrine = 1 or pm.vasopressin = 1 or pm. phenylephrine = 1)
+            WHERE (pm.dopamine = 1 or pm.norepinephrine = 1 or pm.epinephrine = 1 or pm.vasopressin = 1 or pm.phenylephrine = 1)
             AND pm.drugorderoffset is not null 
             AND pm.drugstopoffset is not null
             AND FLOOR(LEAST(pm.drugstopoffset, i.unitdischargeoffset)/60) > FLOOR(GREATEST(pm.drugorderoffset, 0)/60)
@@ -864,7 +864,7 @@ def get_group_id_eicu(args, client):
     elif args.patient_group == 'CHF':
         query = \
             """
-            SELECT DISTINCT ad.patientunitstayid,
+            SELECT DISTINCT ad.patientunitstayid
             FROM physionet-data.eicu_crd.diagnosis ad
             WHERE SUBSTR(ad.icd9code, 1, 3) = '428'
             OR SUBSTR(ad.icd9code, 1, 6) IN ('398.91','402.01','402.11','402.91','404.01','404.03',
@@ -876,7 +876,7 @@ def get_group_id_eicu(args, client):
     elif args.patient_group == 'COPD':
         query = \
             """
-            SELECT DISTINCT ad.patientunitstayid,
+            SELECT DISTINCT ad.patientunitstayid
             FROM physionet-data.eicu_crd.diagnosis ad
             WHERE SUBSTR(ad.icd9code, 1, 3) BETWEEN '490' AND '505'
             OR SUBSTR(ad.icd9code, 1, 5) IN ('416.8','416.9','506.4','508.1','508.8')
@@ -894,7 +894,7 @@ def get_patient_group_eicu(args, client):
     if args.patient_group != 'Generic':
         query = \
             """
-            SELECT i.patientunitstayid, i.gender, i.age, i.race,  
+            SELECT i.patientunitstayid, i.gender, i.age, i.ethnicity,  
                     CASE WHEN lower(i.hospitaldischargestatus) like '%alive%' THEN 0
                         WHEN lower(i.hospitaldischargestatus) like '%expired%' THEN 1
                         ELSE NULL END AS hosp_mort,
@@ -913,7 +913,7 @@ def get_patient_group_eicu(args, client):
     else:
         query = \
             """
-            SELECT i.patientunitstayid, i.gender, i.age, i.race,  
+            SELECT i.patientunitstayid, i.gender, i.age, i.ethnicity,  
                     CASE WHEN lower(i.hospitaldischargestatus) like '%alive%' THEN 0
                         WHEN lower(i.hospitaldischargestatus) like '%expired%' THEN 1
                         ELSE NULL END AS hosp_mort,

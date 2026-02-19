@@ -13,6 +13,66 @@ from extract_sql import *
 # The BigQuery client will automatically use these credentials.
 
 
+# ---------------------------------------------------------------------------
+# Caching helpers -- query BigQuery once, store results as parquet
+# ---------------------------------------------------------------------------
+
+def cached_query(cache_dir, name, query_fn, *args, force=False, **kwargs):
+    """Run *query_fn* and cache the resulting DataFrame as parquet.
+
+    On subsequent calls the parquet file is loaded instead of re-querying
+    BigQuery, unless *force* is True.
+    """
+    path = os.path.join(cache_dir, f"{name}.parquet")
+    if not force and os.path.exists(path):
+        print(f"  [CACHE HIT]  {name}  <-  {path}")
+        return pd.read_parquet(path)
+    print(f"  [QUERYING]   {name}  from BigQuery ...")
+    df = query_fn(*args, **kwargs)
+    os.makedirs(cache_dir, exist_ok=True)
+    df.to_parquet(path)
+    print(f"  [CACHED]     {name}  ->  {path}")
+    return df
+
+
+def _save_params(cache_dir, args):
+    """Persist the extraction parameters so we can detect mismatches later."""
+    params = {
+        'database': args.database,
+        'patient_group': args.patient_group,
+        'age_min': args.age_min,
+        'los_min': args.los_min,
+        'los_max': args.los_max,
+        'time_window': args.time_window,
+    }
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, '_params.json')
+    with open(path, 'w') as f:
+        json.dump(params, f, indent=2)
+
+
+def _check_params(cache_dir, args):
+    """Warn (but don't block) if cached data was generated with different params."""
+    path = os.path.join(cache_dir, '_params.json')
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        cached = json.load(f)
+    current = {
+        'database': args.database,
+        'patient_group': args.patient_group,
+        'age_min': args.age_min,
+        'los_min': args.los_min,
+        'los_max': args.los_max,
+        'time_window': args.time_window,
+    }
+    if cached != current:
+        print("WARNING: Cached data was generated with different parameters!")
+        print(f"  Cached:  {cached}")
+        print(f"  Current: {current}")
+        print("  Use --force_query to re-extract, or delete the cache directory.\n")
+
+
 def extract_mimic(args):
     os.environ["GOOGLE_CLOUD_PROJECT"] = args.project_id
     client = bigquery.Client(project=args.project_id)
@@ -21,8 +81,14 @@ def extract_mimic(args):
     # datatime format to hour
     to_hours = lambda x: max(0, x.days * 24//args.time_window + x.seconds // (3600 * args.time_window))
 
+    # --- cache setup ---
+    raw_dir = os.path.join(args.cache_dir, f"MIMIC_{args.patient_group}", "raw")
+    force = args.force_query
+    _check_params(os.path.join(args.cache_dir, f"MIMIC_{args.patient_group}"), args)
+    _save_params(os.path.join(args.cache_dir, f"MIMIC_{args.patient_group}"), args)
+
     # get group id, could be sepsis3, ARF, shock, COPD, CHF
-    patient = get_patient_group(args, client)
+    patient = cached_query(raw_dir, 'patient', get_patient_group, args, client, force=force)
     print("Patient icu info query done, start querying variables in Dynamic table")
     # get icu stay id and subject id
     icuids_to_keep = patient['stay_id']
@@ -39,14 +105,14 @@ def extract_mimic(args):
 
     # start with mimic_derived_data
     # query bg table
-    bg = query_bg_mimic(client, subject_to_keep)
+    bg = cached_query(raw_dir, 'bg', query_bg_mimic, client, subject_to_keep, force=force)
     # initial process bg table
     bg['hours_in'] = (bg['charttime'] - bg['icu_intime']).apply(to_hours)
     bg.drop(columns=['charttime', 'icu_intime', 'aado2_calc', 'specimen'], inplace=True) # aado2_calc, specimen not used
     bg = process_query_results(bg, fill_df)
 
     # query vital sign
-    vitalsign = query_vitals_mimic(client, icuids_to_keep)
+    vitalsign = cached_query(raw_dir, 'vitalsign', query_vitals_mimic, client, icuids_to_keep, force=force)
     # temperature/glucose is a repeat name but different itemid, rename for now and combine later
     vitalsign.rename(columns={'temperature': 'temp_vital'}, inplace=True)
     vitalsign.rename(columns={'glucose': 'glucose_vital'}, inplace=True)
@@ -55,13 +121,13 @@ def extract_mimic(args):
     vitalsign = process_query_results(vitalsign, fill_df)
 
     # query blood differential
-    blood_diff = query_blood_diff_mimic(client, subject_to_keep)
+    blood_diff = cached_query(raw_dir, 'blood_diff', query_blood_diff_mimic, client, subject_to_keep, force=force)
     blood_diff['hours_in'] = (blood_diff['charttime'] - blood_diff['icu_intime']).apply(to_hours)
     blood_diff.drop(columns=['charttime', 'icu_intime', 'specimen_id'], inplace=True)
     blood_diff = process_query_results(blood_diff, fill_df)
 
     # query cardiac marker
-    cardiac_marker = query_cardiac_marker_mimic(client, subject_to_keep)
+    cardiac_marker = cached_query(raw_dir, 'cardiac_marker', query_cardiac_marker_mimic, client, subject_to_keep, force=force)
     cardiac_marker['troponin_t'].replace(to_replace=[None], value=np.nan, inplace=True)
     cardiac_marker['troponin_t'] = pd.to_numeric(cardiac_marker['troponin_t'])
     cardiac_marker['hours_in'] = (cardiac_marker['charttime'] - cardiac_marker['icu_intime']).apply(to_hours)
@@ -69,7 +135,7 @@ def extract_mimic(args):
     cardiac_marker = process_query_results(cardiac_marker, fill_df)
 
     # query chemistry
-    chemistry = query_chemistry_mimic(client, subject_to_keep)
+    chemistry = cached_query(raw_dir, 'chemistry', query_chemistry_mimic, client, subject_to_keep, force=force)
     # rename glucose into glucose_chem and others
     chemistry.rename(columns={'glucose': 'glucose_chem'}, inplace=True)
     chemistry.rename(columns={'bicarbonate': 'bicarbonate_chem'}, inplace=True)
@@ -82,13 +148,13 @@ def extract_mimic(args):
     chemistry = process_query_results(chemistry, fill_df)
 
     # query coagulation
-    coagulation = query_coagulation_mimic(client, subject_to_keep)
+    coagulation = cached_query(raw_dir, 'coagulation', query_coagulation_mimic, client, subject_to_keep, force=force)
     coagulation['hours_in'] = (coagulation['charttime'] - coagulation['icu_intime']).apply(to_hours)
     coagulation.drop(columns=['charttime', 'icu_intime', 'specimen_id'], inplace=True)
     coagulation = process_query_results(coagulation, fill_df)
 
     # query cbc
-    cbc = query_cbc_mimic(client, subject_to_keep)
+    cbc = cached_query(raw_dir, 'cbc', query_cbc_mimic, client, subject_to_keep, force=force)
     cbc.rename(columns={'hematocrit': 'hematocrit_cbc'}, inplace=True)
     cbc.rename(columns={'hemoglobin': 'hemoglobin_cbc'}, inplace=True)
     # also drop wbc since it's a repeat 51301
@@ -97,11 +163,12 @@ def extract_mimic(args):
     cbc = process_query_results(cbc, fill_df)
 
     # query culture
-    culture = query_culture_mimic(client, subject_to_keep)
+    culture = cached_query(raw_dir, 'culture', query_culture_mimic, client, subject_to_keep, force=force)
     # MIMIC-IV 3.1: culture table no longer exists, query returns empty DataFrame
     # Create placeholder with expected structure when skipped
     if culture.empty:
         # Create empty culture DataFrame with expected multi-level columns
+        # Use float dtype for numeric indicators so pd.get_dummies won't consume them
         culture_cols = pd.MultiIndex.from_tuples([
             ('specimen_culture', 'last'),
             ('screen', 'last'),
@@ -109,6 +176,9 @@ def extract_mimic(args):
             ('has_sensitivity', 'last')
         ])
         culture = pd.DataFrame(index=fill_df.index, columns=culture_cols)
+        culture[('screen', 'last')] = culture[('screen', 'last')].astype(float)
+        culture[('positive_culture', 'last')] = culture[('positive_culture', 'last')].astype(float)
+        culture[('has_sensitivity', 'last')] = culture[('has_sensitivity', 'last')].astype(float)
     else:
         culture.rename(columns={'specimen': 'specimen_culture'}, inplace=True)
         culture['hours_in'] = (culture['charttime'] - culture['icu_intime']).apply(to_hours)
@@ -117,26 +187,26 @@ def extract_mimic(args):
         culture = culture.reindex(fill_df.index)
 
     # query enzyme
-    enzyme = query_enzyme_mimic(client, subject_to_keep)
+    enzyme = cached_query(raw_dir, 'enzyme', query_enzyme_mimic, client, subject_to_keep, force=force)
     # also drop ck_mb since it's a repeat 50911
     enzyme['hours_in'] = (enzyme['charttime'] - enzyme['icu_intime']).apply(to_hours)
     enzyme.drop(columns=['charttime', 'icu_intime', 'specimen_id', 'ck_mb'], inplace=True)
     enzyme = process_query_results(enzyme, fill_df)
 
     # query gcs
-    gcs = query_gcs_mimic(client, icuids_to_keep)
+    gcs = cached_query(raw_dir, 'gcs', query_gcs_mimic, client, icuids_to_keep, force=force)
     gcs['hours_in'] = (gcs['charttime'] - gcs['icu_intime']).apply(to_hours)
     gcs.drop(columns=['charttime', 'icu_intime'], inplace=True)
     gcs = process_query_results(gcs, fill_df)
 
     # query inflammation
-    inflammation = query_inflammation_mimic(client, subject_to_keep)
+    inflammation = cached_query(raw_dir, 'inflammation', query_inflammation_mimic, client, subject_to_keep, force=force)
     inflammation['hours_in'] = (inflammation['charttime'] - inflammation['icu_intime']).apply(to_hours)
     inflammation.drop(columns=['charttime', 'icu_intime'], inplace=True)
     inflammation = process_query_results(inflammation, fill_df)
 
     # query uo
-    uo = query_uo_mimic(client, icuids_to_keep)
+    uo = cached_query(raw_dir, 'uo', query_uo_mimic, client, icuids_to_keep, force=force)
     uo['hours_in'] = (uo['charttime'] - uo['icu_intime']).apply(to_hours)
     uo.drop(columns=['charttime', 'icu_intime'], inplace=True)
     uo = process_query_results(uo, fill_df)
@@ -153,7 +223,7 @@ def extract_mimic(args):
     lab_items = set([str(i) for i in lab_items])
 
     # additional chart and lab
-    chart_lab = query_chart_lab_mimic(client, icuids_to_keep, chart_items, lab_items)
+    chart_lab = cached_query(raw_dir, 'chart_lab', query_chart_lab_mimic, client, icuids_to_keep, chart_items, lab_items, force=force)
     chart_lab['value'] = pd.to_numeric(chart_lab['value'], 'coerce')
     chart_lab = chart_lab.set_index('stay_id').join(patient[['icu_intime']])
     chart_lab['hours_in'] = (chart_lab['charttime'] - chart_lab['icu_intime']).apply(to_hours)
@@ -263,6 +333,11 @@ def extract_mimic(args):
 
     # screen and positive culture needs impute, they are last columns but with float data type
     vital_encode = pd.get_dummies(vital)
+    # When culture is skipped (all NaN), pd.get_dummies creates no dummy columns
+    # and the MultiIndex is preserved.  Flatten to a regular Index of tuples so
+    # that downstream string-keyed culture-site columns can be added correctly.
+    if isinstance(vital_encode.columns, pd.MultiIndex):
+        vital_encode.columns = vital_encode.columns.to_flat_index()
 
     # MIMIC-IV 3.1: Culture columns may be all NaN if culture table was skipped
     # Create mask columns (will be all 0 if culture data was skipped)
@@ -277,11 +352,11 @@ def extract_mimic(args):
     col.insert(col.index(('positive_culture', 'last')) + 1, ('positive_culture', 'mask'))
     col.insert(col.index(('has_sensitivity', 'last')) + 1, ('has_sensitivity', 'mask'))
 
-    vital_final = vital_encode[col[:-3]]
+    vital_final = vital_encode[col[:-3]].copy()
 
     # check if any culture site is missing and fill in empty
     # MIMIC-IV 3.1: If culture was skipped, all 14 sites will be missing - add them all as zeros
-    col_encode = vital_final.columns.to_list()
+    col_encode = [str(c) for c in vital_final.columns.to_list()]
     csite_col = [int(i.split('cul_site')[-1]) for i in col_encode if "cul_site" in i]
     if len(csite_col) < 14:
         # find out which is missing
@@ -289,14 +364,15 @@ def extract_mimic(args):
         missing_col_name = ["('specimen_culture', 'last')_cul_site" + str(i) for i in missing_site]
         for col in missing_col_name:
             vital_final[col] = 0
-    with open('./json_files/mimic_col_order.pickle', 'rb') as f:
-        mimic_col_order = pickle.load(f)
+    with open('./json_files/mimic_col_order.json') as f:
+        mimic_col_order_raw = json.load(f)
+    mimic_col_order = [tuple(c) if isinstance(c, list) else c for c in mimic_col_order_raw]
     vital_final = vital_final[mimic_col_order]
     print('Start querying variables in the Intervention table')
     ####### Done vital table #######
 
     # start query intervention
-    vent_data = query_vent_mimic(client, icuids_to_keep)
+    vent_data = cached_query(raw_dir, 'vent', query_vent_mimic, client, icuids_to_keep, force=force)
     vent_data = compile_intervention(vent_data, 'vent', args.time_window)
 
     ids_with = vent_data['stay_id']
@@ -321,7 +397,7 @@ def extract_mimic(args):
                              axis=0)
 
     # query antibiotics
-    antibiotics = query_antibiotics_mimic(client, icuids_to_keep)
+    antibiotics = cached_query(raw_dir, 'antibiotics', query_antibiotics_mimic, client, icuids_to_keep, force=force)
     antibiotics = compile_intervention(antibiotics, 'antibiotics', args.time_window)
     intervention = intervention.merge(
         antibiotics[['subject_id', 'hadm_id', 'stay_id', 'hours_in', 'antibiotic', 'route']],
@@ -334,7 +410,7 @@ def extract_mimic(args):
                     'milrinone']
     for c in column_names:
         # TOTAL VASOPRESSOR DATA
-        new_data = query_vasoactive_mimic(client, icuids_to_keep, c)
+        new_data = cached_query(raw_dir, f'vasoactive_{c}', query_vasoactive_mimic, client, icuids_to_keep, c, force=force)
         new_data = compile_intervention(new_data, c, args.time_window)
         intervention = intervention.merge(
             new_data[['subject_id', 'hadm_id', 'stay_id', 'hours_in', c]],
@@ -342,9 +418,12 @@ def extract_mimic(args):
             how='left'
         )
 
-    # heparin
-    heparin = query_heparin_mimic(client, subject_to_keep)
-    heparin = compile_intervention(heparin, 'heparin', args.time_window)
+    # heparin (stubbed in MIMIC-IV 3.1 -- table no longer exists)
+    heparin = cached_query(raw_dir, 'heparin', query_heparin_mimic, client, subject_to_keep, force=force)
+    if heparin.empty:
+        heparin = pd.DataFrame(columns=['subject_id', 'hadm_id', 'stay_id', 'hours_in', 'heparin'])
+    else:
+        heparin = compile_intervention(heparin, 'heparin', args.time_window)
     intervention = intervention.merge(
         heparin[['subject_id', 'hadm_id', 'stay_id', 'hours_in', 'heparin']],
         on=['subject_id', 'hadm_id', 'stay_id', 'hours_in'],
@@ -352,7 +431,7 @@ def extract_mimic(args):
     )
 
     # crrt
-    crrt = query_crrt_mimic(client, icuids_to_keep)
+    crrt = cached_query(raw_dir, 'crrt', query_crrt_mimic, client, icuids_to_keep, force=force)
     crrt = compile_intervention(crrt, 'crrt', args.time_window)
     intervention = intervention.merge(
         crrt[['subject_id', 'hadm_id', 'stay_id', 'hours_in', 'crrt']],
@@ -361,7 +440,7 @@ def extract_mimic(args):
     )
 
     # rbc transfusion
-    rbc_trans = query_rbc_trans_mimic(client, icuids_to_keep)
+    rbc_trans = cached_query(raw_dir, 'rbc_trans', query_rbc_trans_mimic, client, icuids_to_keep, force=force)
     rbc_trans = compile_intervention(rbc_trans, 'rbc_trans', args.time_window)
     intervention = intervention.merge(
         rbc_trans[['subject_id', 'hadm_id', 'stay_id', 'hours_in', 'rbc_trans']],
@@ -370,7 +449,7 @@ def extract_mimic(args):
     )
 
     # platelets transfusion
-    platelets_trans = query_pll_trans_mimic(client, icuids_to_keep)
+    platelets_trans = cached_query(raw_dir, 'pll_trans', query_pll_trans_mimic, client, icuids_to_keep, force=force)
     platelets_trans = compile_intervention(platelets_trans, 'platelets_trans', args.time_window)
     intervention = intervention.merge(
         platelets_trans[['subject_id', 'hadm_id', 'stay_id', 'hours_in', 'platelets_trans']],
@@ -379,7 +458,7 @@ def extract_mimic(args):
     )
 
     # ffp transfusion
-    ffp_trans = query_ffp_trans_mimic(client, icuids_to_keep)
+    ffp_trans = cached_query(raw_dir, 'ffp_trans', query_ffp_trans_mimic, client, icuids_to_keep, force=force)
     ffp_trans = compile_intervention(ffp_trans, 'ffp_trans', args.time_window)
     intervention = intervention.merge(
         ffp_trans[['subject_id', 'hadm_id', 'stay_id', 'hours_in', 'ffp_trans']],
@@ -388,7 +467,7 @@ def extract_mimic(args):
     )
 
     # other infusion
-    colloid_bolus = query_colloid_mimic(client, icuids_to_keep)
+    colloid_bolus = cached_query(raw_dir, 'colloid', query_colloid_mimic, client, icuids_to_keep, force=force)
     colloid_bolus = compile_intervention(colloid_bolus, 'colloid_bolus', args.time_window)
     intervention = intervention.merge(
         colloid_bolus[['subject_id', 'hadm_id', 'stay_id', 'hours_in', 'colloid_bolus']],
@@ -397,7 +476,7 @@ def extract_mimic(args):
     )
 
     # other infusion
-    crystalloid_bolus = query_crystalloid_mimic(client, icuids_to_keep)
+    crystalloid_bolus = cached_query(raw_dir, 'crystalloid', query_crystalloid_mimic, client, icuids_to_keep, force=force)
     crystalloid_bolus = compile_intervention(crystalloid_bolus, 'crystalloid_bolus', args.time_window)
     intervention = intervention.merge(
         crystalloid_bolus[['subject_id', 'hadm_id', 'stay_id', 'hours_in', 'crystalloid_bolus']],
@@ -419,8 +498,8 @@ def extract_mimic(args):
 
     # static info
     #  query patients anchor year and comorbidity
-    anchor_year = query_anchor_year_mimic(client, icuids_to_keep)
-    comorbidity = query_comorbidity_mimic(client, icuids_to_keep)
+    anchor_year = cached_query(raw_dir, 'anchor_year', query_anchor_year_mimic, client, icuids_to_keep, force=force)
+    comorbidity = cached_query(raw_dir, 'comorbidity', query_comorbidity_mimic, client, icuids_to_keep, force=force)
     patient.reset_index(inplace=True)
     patient.set_index(ID_COLS, inplace=True)
     comorbidity.set_index(ID_COLS, inplace=True)
@@ -429,9 +508,10 @@ def extract_mimic(args):
 
     if args.exit_point == 'Raw':
         print('Exit point is after querying raw records, saving results...')
-        vital_final.to_hdf(os.path.join(args.output_dir, 'MEEP_MIMIC_vital.h5'), key='mimic_vital')
-        static.to_hdf(os.path.join(args.output_dir, 'MEEP_MIMIC_static.h5'), key='mimic_static')
-        intervention.to_hdf(os.path.join(args.output_dir, 'MEEP_MIMIC_inv.h5'), key='mimic_inv')
+        os.makedirs(args.output_dir, exist_ok=True)
+        vital_final.to_parquet(os.path.join(args.output_dir, 'MEEP_MIMIC_vital.parquet'))
+        static.to_parquet(os.path.join(args.output_dir, 'MEEP_MIMIC_static.parquet'))
+        intervention.to_parquet(os.path.join(args.output_dir, 'MEEP_MIMIC_inv.parquet'))
         return
 
     # remove outliers
@@ -454,9 +534,10 @@ def extract_mimic(args):
 
     if args.exit_point == 'Outlier_removal':
         print('Exit point is after removing outliers, saving results...')
-        vital_final.to_hdf(os.path.join(args.output_dir, 'MEEP_MIMIC_vital.h5'), key='mimic_vital')
-        static.to_hdf(os.path.join(args.output_dir, 'MEEP_MIMIC_static.h5'), key='mimic_static')
-        intervention.to_hdf(os.path.join(args.output_dir, 'MEEP_MIMIC_inv.h5'), key='mimic_inv')
+        os.makedirs(args.output_dir, exist_ok=True)
+        vital_final.to_parquet(os.path.join(args.output_dir, 'MEEP_MIMIC_vital.parquet'))
+        static.to_parquet(os.path.join(args.output_dir, 'MEEP_MIMIC_static.parquet'))
+        intervention.to_parquet(os.path.join(args.output_dir, 'MEEP_MIMIC_inv.parquet'))
         return
 
     # normalize
@@ -465,7 +546,8 @@ def extract_mimic(args):
     col_means, col_stds = vital_final.loc[:, mean_col].mean(axis=0), vital_final.loc[:, mean_col].std(axis=0)
     # saving col_means and col_stds for eicu normalization
     df_mean_std = col_means.to_frame('mean').join(col_stds.to_frame('std'))
-    df_mean_std.to_hdf(os.path.join(args.output_dir, 'MIMIC_mean_std_stats.h5'), 'MIMIC_mean_std')
+    os.makedirs(args.output_dir, exist_ok=True)
+    df_mean_std.to_parquet(os.path.join(args.output_dir, 'MIMIC_mean_std_stats.parquet'))
     vital_final.loc[:, mean_col] = (vital_final.loc[:, mean_col] - col_means) / col_stds
     icustay_means = vital_final.loc[:, mean_col].groupby(ID_COLS).mean()
     # impute
@@ -483,9 +565,10 @@ def extract_mimic(args):
 
     if args.exit_point == 'Impute':
         print('Exit point is after data imputation, saving results...')
-        vital_final.to_hdf(os.path.join(args.output_dir, 'MEEP_MIMIC_vital.h5'), key='mimic_vital')
-        static.to_hdf(os.path.join(args.output_dir, 'MEEP_MIMIC_static.h5'), key='mimic_static')
-        intervention.to_hdf(os.path.join(args.output_dir, 'MEEP_MIMIC_inv.h5'), key='mimic_inv')
+        os.makedirs(args.output_dir, exist_ok=True)
+        vital_final.to_parquet(os.path.join(args.output_dir, 'MEEP_MIMIC_vital.parquet'))
+        static.to_parquet(os.path.join(args.output_dir, 'MEEP_MIMIC_static.parquet'))
+        intervention.to_parquet(os.path.join(args.output_dir, 'MEEP_MIMIC_inv.parquet'))
         return
 
     # split data
@@ -517,15 +600,17 @@ def extract_mimic(args):
 
     if args.exit_point == 'All':
         print('Exit point is after all steps, including train-val-test splitting, saving results...')
-        vital_train.to_hdf(os.path.join(args.output_dir, 'MIMIC_split.hdf5'), key='vital_train')
-        vital_dev.to_hdf(os.path.join(args.output_dir, 'MIMIC_split.hdf5'), key='vital_dev')
-        vital_test.to_hdf(os.path.join(args.output_dir, 'MIMIC_split.hdf5'), key='vital_test')
-        Y_train.to_hdf(os.path.join(args.output_dir, 'MIMIC_split.hdf5'), key='inv_train')
-        Y_dev.to_hdf(os.path.join(args.output_dir, 'MIMIC_split.hdf5'), key='inv_dev')
-        Y_test.to_hdf(os.path.join(args.output_dir, 'MIMIC_split.hdf5'), key='inv_test')
-        static_train.to_hdf(os.path.join(args.output_dir, 'MIMIC_split.hdf5'), key='static_train')
-        static_dev.to_hdf(os.path.join(args.output_dir, 'MIMIC_split.hdf5'), key='static_dev')
-        static_test.to_hdf(os.path.join(args.output_dir, 'MIMIC_split.hdf5'), key='static_test')
+        split_dir = os.path.join(args.output_dir, 'MIMIC_split')
+        os.makedirs(split_dir, exist_ok=True)
+        vital_train.to_parquet(os.path.join(split_dir, 'vital_train.parquet'))
+        vital_dev.to_parquet(os.path.join(split_dir, 'vital_dev.parquet'))
+        vital_test.to_parquet(os.path.join(split_dir, 'vital_test.parquet'))
+        Y_train.to_parquet(os.path.join(split_dir, 'inv_train.parquet'))
+        Y_dev.to_parquet(os.path.join(split_dir, 'inv_dev.parquet'))
+        Y_test.to_parquet(os.path.join(split_dir, 'inv_test.parquet'))
+        static_train.to_parquet(os.path.join(split_dir, 'static_train.parquet'))
+        static_dev.to_parquet(os.path.join(split_dir, 'static_dev.parquet'))
+        static_test.to_parquet(os.path.join(split_dir, 'static_test.parquet'))
     return
 
 
@@ -537,8 +622,15 @@ def extract_eicu(args):
     # minutes to hour
     to_hours = lambda x: int(x // (60 * args.time_window))
     tw_in_min = 60 * args.time_window
+
+    # --- cache setup ---
+    raw_dir = os.path.join(args.cache_dir, f"eICU_{args.patient_group}", "raw")
+    force = args.force_query
+    _check_params(os.path.join(args.cache_dir, f"eICU_{args.patient_group}"), args)
+    _save_params(os.path.join(args.cache_dir, f"eICU_{args.patient_group}"), args)
+
     # get patient group
-    patient = get_patient_group_eicu(args, client)
+    patient = cached_query(raw_dir, 'patient', get_patient_group_eicu, args, client, force=force)
     print("Patient icu info query done, start querying variables in Dynamic table")
     patient['unitadmitoffset'] = 0
     young_age = [str(i) for i in range(args.age_min)]
@@ -553,105 +645,19 @@ def extract_eicu(args):
                                                   on='patientunitstayid')
     fill_df.set_index(ID_COLS + ['hours_in'], inplace=True)
 
-    # blood gas
-    bg = query_bg_eicu(client, icuids_to_keep)
-    bg = fill_query(bg, fill_df, tw_in_min)
+    # ---- chunked vital processing to limit memory ----
+    import gc
+    N_CHUNKS = 20
+    all_stay_ids = sorted(fill_df.index.get_level_values('patientunitstayid').unique())
+    chunks = [all_stay_ids[i::N_CHUNKS] for i in range(N_CHUNKS)]
 
-    # lab
-    lab = query_lab_eicu(client, icuids_to_keep)
-    lab = fill_query(lab, fill_df, tw_in_min)
-
-    # vital
-    vital = query_vital_eicu(client, icuids_to_keep)
-    vital.drop('entryoffset', axis=1, inplace=True)
-    vital = fill_query(vital, fill_df, tw_in_min)
-
-    # microlab
-    microlab = query_microlab_eicu(client, icuids_to_keep)
-    microlab['hours_in'] = microlab['culturetakenoffset'].floordiv(60)
-    microlab.drop(columns=['culturetakenoffset'], inplace=True)
-    microlab.reset_index(inplace=True)
-    microlab = microlab.groupby(ID_COLS + ['hours_in']).agg(['last'])
-    microlab = microlab.reindex(fill_df.index)
-
-    # gcs
-    gcs = query_gcs_eicu(client, icuids_to_keep)
-    gcs = fill_query(gcs, fill_df, tw_in_min)
-
-    # uo
-    uo = query_uo_eicu(client, icuids_to_keep)
-    uo = fill_query(uo, fill_df, tw_in_min)
-
-    # weight
-    weight = query_weight_eicu(client, icuids_to_keep)
-    weight = fill_query(weight, fill_df, tw_in_min)
-
-    # cvp
-    cvp = query_cvp_eicu(client, icuids_to_keep)
-    cvp.loc[:, 'cvp'] = cvp.loc[:, 'cvp'].astype(float) # other wise it converts to pandas.Float64Dtype which is problematic
-    cvp = fill_query(cvp, fill_df, tw_in_min, time='observationoffset')
-
-    # concat all
-    vital = bg.join([lab, vital, gcs, uo, weight, cvp, microlab])
-
-    del bg, lab, gcs, uo, weight, cvp, microlab
-
-    # prepare some other lab variables
-    # not perfect it affects percentage calculation
-    labmakeup = query_labmakeup_eicu(client, icuids_to_keep)
-    labmakeup = fill_query(labmakeup, fill_df, tw_in_min)
-    # tidal volume
-    tidal_vol_obs = query_tidalvol_eicu(client, icuids_to_keep)
-    tidal_vol_obs = fill_query(tidal_vol_obs, fill_df, tw_in_min)
-    vital = vital.join([labmakeup, tidal_vol_obs])
-    del labmakeup, tidal_vol_obs
-
-    # fix invasive and non-invasive blood pressure measurement
-    idx = pd.IndexSlice
-    vital.loc[:, idx[:, 'count']] = vital.loc[:, idx[:, 'count']].fillna(0)
-
-    original = vital.loc[:, idx['ibp_systolic', ['mean', 'count']]].copy(deep=True)
-    makeups = vital.loc[:, idx['nibp_systolic', ['mean', 'count']]].copy(deep=True)
-    filled = combine_cols(makeups, original)
-    vital.loc[:, idx['ibp_systolic', ['mean', 'count']]] = filled.loc[:, ['mean', 'count']].values
-
-    original = vital.loc[:, idx['ibp_diastolic', ['mean', 'count']]].copy(deep=True)
-    makeups = vital.loc[:, idx['nibp_diastolic', ['mean', 'count']]].copy(deep=True)
-    filled = combine_cols(makeups, original)
-    vital.loc[:, idx['ibp_diastolic', ['mean', 'count']]] = filled.loc[:, ['mean', 'count']].values
-
-    original = vital.loc[:, idx['ibp_mean', ['mean', 'count']]].copy(deep=True)
-    makeups = vital.loc[:, idx['nibp_mean', ['mean', 'count']]].copy(deep=True)
-    filled = combine_cols(makeups, original)
-    vital.loc[:, idx['ibp_mean', ['mean', 'count']]] = filled.loc[:, ['mean', 'count']].values
-
-    # drop 'basedeficit' and fix datatype in a fwe columns
-    vital.drop('basedeficit', axis=1, level=0, inplace=True)
-    vital.drop('index', axis=1, level=0, inplace=True)
-    vital = pd.get_dummies(vital)
-    # screen and positive culture needs impute, they are last columns but with float data type
-    vital[('positive', 'mask')] = (~vital[('positive', 'last')].isnull()).astype(float)
-    vital[('screen', 'mask')] = (~vital[('screen', 'last')].isnull()).astype(float)
-    vital[('has_sensitivity', 'mask')] = (~vital[('has_sensitivity', 'last')].isnull()).astype(float)
-
-    # make empty columns
+    # Pre-load JSON config files (small, reused per chunk)
     with open("./json_files/eicu_empty_columns.json") as f:
         columns_to_make = json.load(f)
-    for col in columns_to_make:
-        vital[(col, 'mean')] = fill_df.values
-        vital[(col, 'count')] = 0
-
-    # other empty columns in culturesize since eicu culturesite is less complicated compared with mimic
     with open("./json_files/eicu_empty_culture.json") as f:
         empty_culture = json.load(f)
-    for col in empty_culture:
-        vital[col] = 0
-
-    # organize columns
     with open("./json_files/eicu_col_order.json") as f:
         col = json.load(f)
-
-    # generate final col
     breakpoint1 = col.index('positive')
     breakpoint2 = col.index("('culturesite', 'last')_culturesite0")
     col_ready = []
@@ -664,12 +670,101 @@ def extract_eicu(args):
     for i in range(breakpoint2, len(col)):
         col_ready.append(col[i])
 
-    vital = vital[col_ready]
+    chunk_dir = os.path.join(raw_dir, '_vital_chunks')
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    for ci, chunk_ids in enumerate(chunks):
+        chunk_path = os.path.join(chunk_dir, f'chunk_{ci:03d}.parquet')
+        if os.path.exists(chunk_path):
+            print(f'  Vital chunk {ci+1}/{N_CHUNKS} already on disk, skipping.')
+            continue
+
+        print(f'  Processing vital chunk {ci+1}/{N_CHUNKS} ({len(chunk_ids)} stays)...')
+        chunk_set = set(chunk_ids)
+        chunk_fill = fill_df[fill_df.index.get_level_values('patientunitstayid').isin(chunk_set)]
+
+        def _read_and_filter(name):
+            df = pd.read_parquet(os.path.join(raw_dir, f'{name}.parquet'))
+            df = df[df['patientunitstayid'].isin(chunk_set)]
+            for c in df.columns:
+                if df[c].dtype == object and c not in ('patientunitstayid',):
+                    df[c] = pd.to_numeric(df[c], errors='coerce')
+            return df
+
+        bg = fill_query(_read_and_filter('bg'), chunk_fill, tw_in_min)
+        lab = fill_query(_read_and_filter('lab'), chunk_fill, tw_in_min)
+        vital_raw = _read_and_filter('vital')
+        vital_raw.drop('entryoffset', axis=1, inplace=True)
+        vital_raw = fill_query(vital_raw, chunk_fill, tw_in_min)
+
+        microlab = _read_and_filter('microlab')
+        microlab['hours_in'] = microlab['culturetakenoffset'].floordiv(60)
+        microlab.drop(columns=['culturetakenoffset'], inplace=True)
+        microlab.reset_index(inplace=True)
+        microlab = microlab.groupby(ID_COLS + ['hours_in']).agg(['last'])
+        microlab = microlab.reindex(chunk_fill.index)
+
+        gcs = fill_query(_read_and_filter('gcs'), chunk_fill, tw_in_min)
+        uo = fill_query(_read_and_filter('uo'), chunk_fill, tw_in_min)
+        weight = fill_query(_read_and_filter('weight'), chunk_fill, tw_in_min)
+
+        cvp_raw = _read_and_filter('cvp')
+        cvp_raw.loc[:, 'cvp'] = cvp_raw.loc[:, 'cvp'].astype(float)
+        cvp_raw = fill_query(cvp_raw, chunk_fill, tw_in_min, time='observationoffset')
+
+        vital_c = bg.join([lab, vital_raw, gcs, uo, weight, cvp_raw, microlab])
+        del bg, lab, vital_raw, gcs, uo, weight, cvp_raw, microlab
+
+        labmakeup = fill_query(_read_and_filter('labmakeup'), chunk_fill, tw_in_min)
+        tidal_vol_obs = fill_query(_read_and_filter('tidal_vol'), chunk_fill, tw_in_min)
+        vital_c = vital_c.join([labmakeup, tidal_vol_obs])
+        del labmakeup, tidal_vol_obs
+
+        idx = pd.IndexSlice
+        vital_c.loc[:, idx[:, 'count']] = vital_c.loc[:, idx[:, 'count']].fillna(0)
+
+        original = vital_c.loc[:, idx['ibp_systolic', ['mean', 'count']]].copy(deep=True)
+        makeups = vital_c.loc[:, idx['nibp_systolic', ['mean', 'count']]].copy(deep=True)
+        filled = combine_cols(makeups, original)
+        vital_c.loc[:, idx['ibp_systolic', ['mean', 'count']]] = filled.loc[:, ['mean', 'count']].values
+
+        original = vital_c.loc[:, idx['ibp_diastolic', ['mean', 'count']]].copy(deep=True)
+        makeups = vital_c.loc[:, idx['nibp_diastolic', ['mean', 'count']]].copy(deep=True)
+        filled = combine_cols(makeups, original)
+        vital_c.loc[:, idx['ibp_diastolic', ['mean', 'count']]] = filled.loc[:, ['mean', 'count']].values
+
+        original = vital_c.loc[:, idx['ibp_mean', ['mean', 'count']]].copy(deep=True)
+        makeups = vital_c.loc[:, idx['nibp_mean', ['mean', 'count']]].copy(deep=True)
+        filled = combine_cols(makeups, original)
+        vital_c.loc[:, idx['ibp_mean', ['mean', 'count']]] = filled.loc[:, ['mean', 'count']].values
+
+        vital_c.drop('basedeficit', axis=1, level=0, inplace=True)
+        vital_c.drop('index', axis=1, level=0, inplace=True)
+        vital_c = pd.get_dummies(vital_c)
+        vital_c[('positive', 'mask')] = (~vital_c[('positive', 'last')].isnull()).astype(float)
+        vital_c[('screen', 'mask')] = (~vital_c[('screen', 'last')].isnull()).astype(float)
+        vital_c[('has_sensitivity', 'mask')] = (~vital_c[('has_sensitivity', 'last')].isnull()).astype(float)
+
+        for c_name in columns_to_make:
+            vital_c[(c_name, 'mean')] = chunk_fill.values
+            vital_c[(c_name, 'count')] = 0
+        for c_name in empty_culture:
+            vital_c[c_name] = 0
+
+        vital_c = vital_c.reindex(columns=col_ready, fill_value=0)
+        vital_c.to_parquet(chunk_path)
+        del vital_c, chunk_fill
+        gc.collect()
+        print(f'  Chunk {ci+1}/{N_CHUNKS} done -> {chunk_path}')
+
+    # vital chunks stay on disk -- reassembled lazily at save time
+    _vital_chunk_dir = chunk_dir
+    _vital_n_chunks = N_CHUNKS
     print('Start querying variables in the Intervention table')
 
     # Intervention table
     # ventilation
-    vent= query_vent_eicu(client, icuids_to_keep, tw_in_min)
+    vent = cached_query(raw_dir, 'vent', query_vent_eicu, client, icuids_to_keep, tw_in_min, force=force)
     vent_data = process_inv(vent, 'vent')
     ids_with = vent_data['patientunitstayid']
     ids_with = set(map(int, ids_with))
@@ -704,7 +799,7 @@ def extract_eicu(args):
                     'milrinone', 'heparin']
 
     for c in column_names:
-        med = query_med_eicu(client, icuids_to_keep, c, tw_in_min)
+        med = cached_query(raw_dir, f'med_{c}', query_med_eicu, client, icuids_to_keep, c, tw_in_min, force=force)
         # 'epinephrine',  'dopamine', 'norepinephrine', 'phenylephrine', \
         #    'vasopressin', 'dobutamine', 'milrinone',  'heparin',
         med = process_inv(med, c)
@@ -715,7 +810,7 @@ def extract_eicu(args):
         )
 
     # antibiotics
-    anti = query_anti_eicu(client, icuids_to_keep, tw_in_min)
+    anti = cached_query(raw_dir, 'antibiotics', query_anti_eicu, client, icuids_to_keep, tw_in_min, force=force)
     anti = process_inv(anti, 'antib')
     intervention = intervention.merge(
         anti[['patientunitstayid', 'hours_in', 'antib']],
@@ -724,7 +819,7 @@ def extract_eicu(args):
     )
 
     # crrt
-    crrt = query_crrt_eicu(client, icuids_to_keep, tw_in_min)
+    crrt = cached_query(raw_dir, 'crrt', query_crrt_eicu, client, icuids_to_keep, tw_in_min, force=force)
     crrt = process_inv(crrt, 'crrt')
     intervention = intervention.merge(
         crrt[['patientunitstayid', 'hours_in', 'crrt']],
@@ -733,7 +828,7 @@ def extract_eicu(args):
     )
 
     # rbc transfusion
-    rbc = query_rbc_trans_eicu(client, icuids_to_keep, tw_in_min)
+    rbc = cached_query(raw_dir, 'rbc_trans', query_rbc_trans_eicu, client, icuids_to_keep, tw_in_min, force=force)
     rbc = process_inv(rbc, 'rbc')
     intervention = intervention.merge(
         rbc[['patientunitstayid', 'hours_in', 'rbc']],
@@ -742,7 +837,7 @@ def extract_eicu(args):
     )
 
     # ffp transfusion
-    ffp = query_ffp_trans_eicu(client, icuids_to_keep, tw_in_min)
+    ffp = cached_query(raw_dir, 'ffp_trans', query_ffp_trans_eicu, client, icuids_to_keep, tw_in_min, force=force)
     ffp = process_inv(ffp, 'ffp')
     intervention = intervention.merge(
         ffp[['patientunitstayid', 'hours_in', 'ffp']],
@@ -751,7 +846,7 @@ def extract_eicu(args):
     )
 
     # platelets transfusion
-    platelets = query_pll_trans_eicu(client, icuids_to_keep, tw_in_min)
+    platelets = cached_query(raw_dir, 'pll_trans', query_pll_trans_eicu, client, icuids_to_keep, tw_in_min, force=force)
     platelets = process_inv(platelets, 'platelets')
     intervention = intervention.merge(
         platelets[['patientunitstayid', 'hours_in', 'platelets']],
@@ -760,7 +855,7 @@ def extract_eicu(args):
     )
 
     #colloid
-    colloid = query_colloid_eicu(client, icuids_to_keep, tw_in_min)
+    colloid = cached_query(raw_dir, 'colloid', query_colloid_eicu, client, icuids_to_keep, tw_in_min, force=force)
     colloid = process_inv(colloid, 'colloid')
     intervention = intervention.merge(
         colloid[['patientunitstayid', 'hours_in', 'colloid']],
@@ -769,7 +864,7 @@ def extract_eicu(args):
     )
 
     #crystalloid
-    crystalloid = query_crystalloid_eicu(client, icuids_to_keep, tw_in_min)
+    crystalloid = cached_query(raw_dir, 'crystalloid', query_crystalloid_eicu, client, icuids_to_keep, tw_in_min, force=force)
     crystalloid = process_inv(crystalloid, 'crystalloid')
     intervention = intervention.merge(
         crystalloid[['patientunitstayid', 'hours_in', 'crystalloid']],
@@ -793,7 +888,7 @@ def extract_eicu(args):
 
     # static query
     # commo
-    commo = query_comorbidity_eicu(client, icuids_to_keep)
+    commo = cached_query(raw_dir, 'comorbidity', query_comorbidity_eicu, client, icuids_to_keep, force=force)
     commo.set_index('patientunitstayid', inplace=True)
     static = patient.join(commo)
     static_col = static.columns.tolist()
@@ -803,10 +898,29 @@ def extract_eicu(args):
 
     if args.exit_point == 'Raw':
         print('Exit point is after querying raw records, saving results...')
-        intervention.to_hdf(os.path.join(args.output_dir, 'MEEP_eICU_inv.h5'), key='eicu_inv')
-        static.to_hdf(os.path.join(args.output_dir, 'MEEP_eICU_static.h5'), key='eicu_static')
-        vital.to_hdf(os.path.join(args.output_dir, 'MEEP_eICU_vital.h5'), key='eicu_vital')
+        os.makedirs(args.output_dir, exist_ok=True)
+        intervention.to_parquet(os.path.join(args.output_dir, 'MEEP_eICU_inv.parquet'))
+        static.to_parquet(os.path.join(args.output_dir, 'MEEP_eICU_static.parquet'))
+        # Stream vital chunks to output without loading all into memory
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        vital_out = os.path.join(args.output_dir, 'MEEP_eICU_vital.parquet')
+        # Read first chunk to establish the canonical schema
+        schema = pq.read_schema(os.path.join(_vital_chunk_dir, 'chunk_000.parquet'))
+        writer = pq.ParquetWriter(vital_out, schema)
+        for i in range(_vital_n_chunks):
+            tbl = pq.read_table(os.path.join(_vital_chunk_dir, f'chunk_{i:03d}.parquet'))
+            tbl = tbl.cast(schema)
+            writer.write_table(tbl)
+            del tbl
+        writer.close()
+        print(f'  Vital written from {_vital_n_chunks} chunks -> {vital_out}')
         return
+
+    # For later exit points, we need vital in memory
+    vital = pd.concat([pd.read_parquet(os.path.join(_vital_chunk_dir, f'chunk_{i:03d}.parquet'))
+                        for i in range(_vital_n_chunks)])
+    vital.sort_index(inplace=True)
 
     total_cols = vital.columns.tolist()
     mean_col = [i for i in total_cols if 'mean' in i]
@@ -828,9 +942,10 @@ def extract_eicu(args):
 
     if args.exit_point == 'Outlier_removal':
         print('Exit point is after removing outliers, saving results...')
-        intervention.to_hdf(os.path.join(args.output_dir, 'MEEP_eICU_inv.h5'), key='eicu_inv')
-        static.to_hdf(os.path.join(args.output_dir, 'MEEP_eICU_static.h5'), key='eicu_static')
-        vital.to_hdf(os.path.join(args.output_dir, 'MEEP_eICU_vital.h5'), key='eicu_vital')
+        os.makedirs(args.output_dir, exist_ok=True)
+        intervention.to_parquet(os.path.join(args.output_dir, 'MEEP_eICU_inv.parquet'))
+        static.to_parquet(os.path.join(args.output_dir, 'MEEP_eICU_static.parquet'))
+        vital.to_parquet(os.path.join(args.output_dir, 'MEEP_eICU_vital.parquet'))
         return
 
     # read_mimic col means col stds
@@ -842,7 +957,7 @@ def extract_eicu(args):
     # col_means, col_stds = vital.loc[:, mean_col].mean(axis=0), vital.loc[:, mean_col].std(axis=0)
     # first use mimic mean to normorlize
     if args.norm_eicu == 'MIMIC':
-        mimic_mean_std = pd.read_hdf(os.path.join(args.output_dir, 'MIMIC_mean_std_stats.h5'), key='MIMIC_mean_std')
+        mimic_mean_std = pd.read_parquet(os.path.join(args.output_dir, 'MIMIC_mean_std_stats.parquet'))
         col_means, col_stds = mimic_mean_std.loc[:, 'mean'], mimic_mean_std.loc[:, 'std']
         col_means.index = mean_col
         col_stds.index = mean_col
@@ -863,9 +978,10 @@ def extract_eicu(args):
 
     if args.exit_point == 'Impute':
         print('Exit point is after data imputation, saving results...')
-        intervention.to_hdf(os.path.join(args.output_dir, 'MEEP_eICU_inv.h5'), key='eicu_inv')
-        static.to_hdf(os.path.join(args.output_dir, 'MEEP_eICU_static.h5'), key='eicu_static')
-        vital.to_hdf(os.path.join(args.output_dir, 'MEEP_eICU_vital.h5'), key='eicu_vital')
+        os.makedirs(args.output_dir, exist_ok=True)
+        intervention.to_parquet(os.path.join(args.output_dir, 'MEEP_eICU_inv.parquet'))
+        static.to_parquet(os.path.join(args.output_dir, 'MEEP_eICU_static.parquet'))
+        vital.to_parquet(os.path.join(args.output_dir, 'MEEP_eICU_vital.parquet'))
         return
 
     # split data
@@ -897,14 +1013,16 @@ def extract_eicu(args):
 
     if args.exit_point == 'All':
         print('Exit point is after all steps, including train-val-test splitting, saving results...')
-        vital_train.to_hdf(os.path.join(args.output_dir, 'eICU_split.hdf5'), key='vital_train')
-        vital_dev.to_hdf(os.path.join(args.output_dir, 'eICU_split.hdf5'), key='vital_dev')
-        vital_test.to_hdf(os.path.join(args.output_dir, 'eICU_split.hdf5'), key='vital_test')
-        Y_train.to_hdf(os.path.join(args.output_dir, 'eICU_split.hdf5'), key='inv_train')
-        Y_dev.to_hdf(os.path.join(args.output_dir, 'eICU_split.hdf5'), key='inv_dev')
-        Y_test.to_hdf(os.path.join(args.output_dir, 'eICU_split.hdf5'), key='inv_test')
-        static_train.to_hdf(os.path.join(args.output_dir, 'eICU_split.hdf5'), key='static_train')
-        static_dev.to_hdf(os.path.join(args.output_dir, 'eICU_split.hdf5'), key='static_dev')
-        static_test.to_hdf(os.path.join(args.output_dir, 'eICU_split.hdf5'), key='static_test')
+        split_dir = os.path.join(args.output_dir, 'eICU_split')
+        os.makedirs(split_dir, exist_ok=True)
+        vital_train.to_parquet(os.path.join(split_dir, 'vital_train.parquet'))
+        vital_dev.to_parquet(os.path.join(split_dir, 'vital_dev.parquet'))
+        vital_test.to_parquet(os.path.join(split_dir, 'vital_test.parquet'))
+        Y_train.to_parquet(os.path.join(split_dir, 'inv_train.parquet'))
+        Y_dev.to_parquet(os.path.join(split_dir, 'inv_dev.parquet'))
+        Y_test.to_parquet(os.path.join(split_dir, 'inv_test.parquet'))
+        static_train.to_parquet(os.path.join(split_dir, 'static_train.parquet'))
+        static_dev.to_parquet(os.path.join(split_dir, 'static_dev.parquet'))
+        static_test.to_parquet(os.path.join(split_dir, 'static_test.parquet'))
     return
 
