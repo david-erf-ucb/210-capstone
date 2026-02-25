@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>METRE Benchmark Results</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+    h1 { color: #333; }
+    .chart-container { position: relative; height: 350px; margin: 30px 0; }
+    .chart-wrapper { margin-bottom: 40px; }
+  </style>
+</head>
+<body>
+  <h1>METRE Benchmark Results</h1>
+  <p>MIMIC-IV 3.1, LR & RF models. See BENCHMARK_SUMMARY.md for full analysis.</p>
+
+  <div class="chart-wrapper">
+    <h2>Test AUC by Task and Model</h2>
+    <div class="chart-container"><canvas id="aucChart"></canvas></div>
+  </div>
+
+  <div class="chart-wrapper">
+    <h2>Class Balance (n stays)</h2>
+    <div class="chart-container"><canvas id="balanceChart"></canvas></div>
+  </div>
+
+  <div class="chart-wrapper">
+    <h2>% Positive Class by Task</h2>
+    <div class="chart-container"><canvas id="pctChart"></canvas></div>
+  </div>
+
+  <div class="chart-wrapper">
+    <h2>Precision vs Recall (threshold 0.5)</h2>
+    <div class="chart-container"><canvas id="prChart"></canvas></div>
+  </div>
+
+  <script>
+    const tasks = ['hosp_mort_24h', 'ARF_2h', 'ARF_6h', 'shock_2h', 'shock_6h'];
+    const metrics = {
+      LR: { auc: [0.809, 0.661, 0.639, 0.674, 0.670], prec: [0.23, 0.52, 0.36, 0.17, 0.12], rec: [0.68, 0.52, 0.54, 0.54, 0.57] },
+      RF: { auc: [0.841, 0.693, 0.659, 0.700, 0.677], prec: [0.67, 0.64, 0.55, 0.26, 0.18], rec: [0.04, 0.31, 0.04, 0.13, 0.00] }
+    };
+    const pop = { n_total: [8736, 2854, 2464, 7181, 6927], n_pos: [787, 1053, 663, 720, 466], pct: [9.01, 36.9, 26.91, 10.03, 6.73] };
+
+    new Chart(document.getElementById('aucChart'), {
+      type: 'bar',
+      data: {
+        labels: tasks,
+        datasets: [
+          { label: 'LR', data: metrics.LR.auc, backgroundColor: 'rgba(70, 130, 180, 0.8)' },
+          { label: 'RF', data: metrics.RF.auc, backgroundColor: 'rgba(255, 127, 80, 0.8)' }
+        ]
+      },
+      options: { scales: { y: { min: 0.5, max: 0.9 } }, plugins: { legend: {} } }
+    });
+
+    new Chart(document.getElementById('balanceChart'), {
+      type: 'bar',
+      data: {
+        labels: tasks,
+        datasets: [
+          { label: 'Negative', data: pop.n_total.map((n, i) => n - pop.n_pos[i]), backgroundColor: 'lightsteelblue' },
+          { label: 'Positive', data: pop.n_pos, backgroundColor: 'indianred' }
+        ]
+      },
+      options: { scales: { x: { stacked: true }, y: { stacked: true } }, plugins: { legend: {} } }
+    });
+
+    new Chart(document.getElementById('pctChart'), {
+      type: 'bar',
+      data: {
+        labels: tasks,
+        datasets: [{ label: '% positive', data: pop.pct, backgroundColor: 'steelblue' }]
+      },
+      options: { scales: { y: { beginAtZero: true, max: 50 } }, plugins: { legend: { display: false } } }
+    });
+
+    new Chart(document.getElementById('prChart'), {
+      type: 'scatter',
+      data: {
+        datasets: [
+          { label: 'LR', data: tasks.map((t, i) => ({ x: metrics.LR.rec[i], y: metrics.LR.prec[i] })), backgroundColor: 'steelblue', pointRadius: 10 },
+          { label: 'RF', data: tasks.map((t, i) => ({ x: metrics.RF.rec[i], y: metrics.RF.prec[i] })), backgroundColor: 'coral', pointRadius: 10 }
+        ]
+      },
+      options: {
+        scales: { x: { min: 0, max: 1, title: { display: true, text: 'Recall' } }, y: { min: 0, max: 1, title: { display: true, text: 'Precision' } } },
+        plugins: { legend: {}, tooltip: { callbacks: { label: c => tasks[c.dataIndex] + ': ' + c.parsed.x.toFixed(2) + ', ' + c.parsed.y.toFixed(2) } } }
+      }
+    });
+  </script>
+</body>
+</html>

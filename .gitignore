@@ -6,5 +6,7 @@ test_results/
 cache/
 METRE/output/*.parquet
 METRE/output/*.csv
+METRE/output/*.npy
+METRE/output/benchmarks/models/*.joblib
 *.pyc
 .DS_Store
