@@ -8,5 +8,9 @@ METRE/output/*.parquet
 METRE/output/*.csv
 METRE/output/*.npy
 METRE/output/benchmarks/models/*.joblib
+# Patient-level data (stay_id, subject_id, demographics, outcomes)
+METRE/output/benchmarks/test_predictions.csv
+# eICU stay IDs (patient identifiers)
+METRE/resources/eicu_sepsis_3_id.csv
 *.pyc
 .DS_Store
